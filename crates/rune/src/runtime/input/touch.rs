@@ -2,7 +2,9 @@
 //! button. It presses where it lands, so a tap clicks; dragging an element that drags
 //! (`El::on_drag`: a slider, a scroll bar) drags it; any other drag pans the scroll viewport
 //! under the finger (`runtime/scroll/touch.rs`), flinging it on with momentum, and cancels
-//! the press. Further fingers are ignored while one is down.
+//! the press. A finger held still for [`LONG_PRESS`] is a secondary click there, as Chromium's
+//! long press sends `contextmenu`: the press it began lets go without a click and the menu opens
+//! under the finger, which then lifts on nothing. Further fingers are ignored while one is down.
 use super::*;
 use std::collections::VecDeque;
 
@@ -13,6 +15,9 @@ const FLING_HOLD: f64 = 0.1;
 /// A fling takes its speed from the finger's last this many seconds, as Chromium's velocity
 /// tracker does: one event alone misreads a finger that slows as it lifts.
 const FLING_WINDOW: f64 = 0.1;
+/// A finger held still this long (seconds) opens the menu under it (Chromium's
+/// `long_press_time_in_ms`).
+const LONG_PRESS: f64 = 0.5;
 
 /// A host's touch phase, as winit reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +42,8 @@ struct Finger {
     /// (time, travel along the pan's axis) of the events in the last `FLING_WINDOW`.
     samples: VecDeque<(f64, f32)>,
     mode: Mode,
+    /// When (clock seconds), still pending, it becomes a long press.
+    hold_due: f64,
     /// The vertical viewport under the finger, held until the pan picks its axis.
     scroll: Option<NodeId>,
     horizontal: bool,
@@ -48,6 +55,8 @@ enum Mode {
     Pending,
     Drag,
     Pan,
+    /// A long press opened the menu under it: it lifts on nothing.
+    Menu,
 }
 
 impl<S: 'static> Runtime<S> {
@@ -71,7 +80,9 @@ impl<S: 'static> Runtime<S> {
         let scroll = self.touch_scroll_start(x, y);
         self.pointer_move(x, y);
         self.pointer_down(x, y);
-        self.touch.finger = Some(Finger { id, origin: (x, y), samples: VecDeque::from([(time, 0.0)]), mode: Mode::Pending, scroll, horizontal: false });
+        let hold_due = self.clock + LONG_PRESS;
+        self.schedule_wakes([std::time::Duration::from_secs_f64(LONG_PRESS)]);
+        self.touch.finger = Some(Finger { id, origin: (x, y), samples: VecDeque::from([(time, 0.0)]), mode: Mode::Pending, hold_due, scroll, horizontal: false });
     }
 
     fn touch_move(&mut self, id: u64, x: f32, y: f32, time: f64) {
@@ -102,6 +113,10 @@ impl<S: 'static> Runtime<S> {
     fn touch_up(&mut self, id: u64, x: f32, y: f32, time: f64, cancelled: bool) {
         let Some(f) = self.touch.finger.take_if(|f| f.id == id) else { return };
         let pan = f.mode == Mode::Pan;
+        if f.mode == Mode::Menu {
+            self.pointer_leave();
+            return;
+        }
         let held = f.samples.back().is_none_or(|&(at, _)| time - at >= FLING_HOLD);
         let velocity = if pan && !cancelled && !held { slope(&f.samples) } else { 0.0 };
         self.touch_scroll_end(f.scroll, velocity);
@@ -115,6 +130,23 @@ impl<S: 'static> Runtime<S> {
         self.pointer_up(x, y);
         // No hover is left under a lifted finger.
         self.pointer_leave();
+    }
+
+    /// A finger still within the slop when its long press is due: the press it began lets go
+    /// without a click (a drag it started hears a cancelled `Phase::Up`), and a secondary click
+    /// lands where it went down.
+    pub(in crate::runtime) fn fire_touch_hold(&mut self) {
+        let Some(f) = self.touch.finger.as_ref().filter(|f| f.mode == Mode::Pending && self.clock + 1e-6 >= f.hold_due) else { return };
+        let ((x, y), scroll) = (f.origin, f.scroll);
+        self.touch_scroll_end(scroll, 0.0);
+        if !self.cancel_drag() {
+            self.press.drop_held();
+            self.text_sel.dragging = false;
+            self.end_press_repeat();
+        }
+        self.secondary_down(x, y);
+        self.secondary_up(x, y);
+        if let Some(f) = self.touch.finger.as_mut() { (f.mode, f.scroll) = (Mode::Menu, None); }
     }
 
     /// Whether the held press is on an element that drags, so a finger drags it, not the page.
@@ -135,16 +167,17 @@ fn slope(samples: &VecDeque<(f64, f32)>) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ScrollSpec, col, el, text};
+    use crate::{PointerPress, ScrollSpec, col, el, text};
 
     #[derive(Default)]
-    struct S { taps: Vec<usize>, drags: Vec<f32> }
+    struct S { taps: Vec<usize>, drags: Vec<f32>, menus: Vec<(usize, f32, f32)> }
 
     fn view(_: &S, _: &mut Cx<S>) -> El {
         col().size(200.0, 300.0)
             .child(el().key("knob").size(200.0, 40.0).on_drag(|s: &mut S, d: &mut Drag, _| s.drags.push(d.dx)))
             .child(col().key("list").w_full().h(200.0).scroll(ScrollSpec { stick_bottom: false })
-                .children((0..30).map(|i| el().key(format!("row{i}")).w_full().h(40.0).on_press(move |s: &mut S| s.taps.push(i)))))
+                .children((0..30).map(|i| el().key(format!("row{i}")).w_full().h(40.0).on_press(move |s: &mut S| s.taps.push(i))
+                    .on_secondary_press(move |s: &mut S, p: PointerPress, _| s.menus.push((i, p.x, p.y))))))
     }
 
     fn rig() -> Runtime<S> {
@@ -245,6 +278,34 @@ mod tests {
         let lifted = offset(&rt);
         for _ in 0..120 { rt.frame(1.0 / 60.0); }
         assert!(offset(&rt) > lifted + 400.0, "coasted {} points", offset(&rt) - lifted);
+    }
+
+    #[test]
+    fn a_finger_held_still_opens_the_menu_there_and_lifts_on_nothing() {
+        let mut rt = rig();
+        rt.touch(1, TouchPhase::Started, 100.0, 70.0, 0.0);
+        rt.frame(0.3);
+        rt.touch(1, TouchPhase::Moved, 103.0, 72.0, 0.3);
+        assert!(rt.state.menus.is_empty(), "not yet");
+        rt.frame(0.25);
+        assert_eq!(rt.state.menus, [(0, 100.0, 70.0)]);
+        rt.touch(1, TouchPhase::Moved, 100.0, 20.0, 0.6);
+        rt.touch(1, TouchPhase::Ended, 100.0, 20.0, 0.7);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.taps.is_empty(), "the lift clicks nothing");
+        assert_eq!(offset(&rt), 0.0, "and pans nothing");
+    }
+
+    #[test]
+    fn a_tap_or_a_pan_opens_no_menu() {
+        let mut rt = rig();
+        rt.touch(1, TouchPhase::Started, 100.0, 70.0, 0.0);
+        rt.touch(1, TouchPhase::Ended, 100.0, 70.0, 0.1);
+        rt.frame(0.6);
+        swipe(&mut rt, (100.0, 200.0), -100.0, 5);
+        rt.frame(0.6);
+        assert_eq!(rt.state.taps, [0]);
+        assert!(rt.state.menus.is_empty());
     }
 
     #[test]
